@@ -1,32 +1,46 @@
 // File: pages/index.js
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Head from 'next/head';
 
 export default function Home() {
   const [url, setUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [jobId, setJobId] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
+  const [pollingInterval, setPollingInterval] = useState(null);
+  const [progressStage, setProgressStage] = useState('');
   const [examples, setExamples] = useState([
     'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     'https://www.youtube.com/watch?v=jNQXAC9IVRw',
     'https://youtu.be/xvFZjo5PgG0'
   ]);
 
+  // Handle form submission
   const handleSubmit = async (e) => {
     e.preventDefault();
     await processUrl(url);
   };
   
+  // Start processing a URL
   const processUrl = async (inputUrl) => {
     setIsLoading(true);
     setError(null);
     setResult(null);
+    setJobId(null);
+    setProgressStage('');
     setUrl(inputUrl);
+    
+    // Clear any existing polling interval
+    if (pollingInterval) {
+      clearInterval(pollingInterval);
+      setPollingInterval(null);
+    }
 
     try {
-      const response = await fetch('/api/get-summary', {
+      // Step 1: Create a new job
+      const createResponse = await fetch('/api/create-job', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -34,31 +48,85 @@ export default function Home() {
         body: JSON.stringify({ url: inputUrl }),
       });
 
-      const data = await response.json();
-      setResult(data);
+      const createData = await createResponse.json();
       
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to get video summary');
+      if (!createResponse.ok || !createData.success) {
+        throw new Error(createData.error || 'Failed to create job');
       }
       
-      // Default to summary tab if summary exists, otherwise show transcript
-      if (data.summary) {
-        setActiveTab('summary');
-      } else {
-        setActiveTab('transcript');
-      }
+      // Got job ID, start polling
+      setJobId(createData.jobId);
+      startPolling(createData.jobId);
     } catch (err) {
       setError(err.message);
-    } finally {
       setIsLoading(false);
     }
   };
+  
+  // Start polling for job status
+  const startPolling = (id) => {
+    // Start with 1-second intervals
+    const interval = setInterval(() => {
+      checkJobStatus(id);
+    }, 1000);
+    
+    setPollingInterval(interval);
+  };
+  
+  // Check job status
+  const checkJobStatus = async (id) => {
+    try {
+      const response = await fetch(`/api/job-status?jobId=${id}`);
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to get job status');
+      }
+      
+      // Update progress stage
+      if (data.status === 'processing' && data.progressStage) {
+        setProgressStage(data.progressStage);
+      }
+      
+      // If job is completed or failed, stop polling
+      if (data.status === 'completed' || data.status === 'failed') {
+        clearInterval(pollingInterval);
+        setPollingInterval(null);
+        setIsLoading(false);
+        
+        if (data.status === 'failed') {
+          setError(data.error || 'Processing failed');
+        } else {
+          setResult(data);
+          
+          // Default to summary tab if summary exists, otherwise show transcript
+          if (data.summary) {
+            setActiveTab('summary');
+          } else {
+            setActiveTab('transcript');
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error checking job status:', err);
+      // Don't stop polling on temporary errors
+    }
+  };
+  
+  // Clean up interval on component unmount
+  useEffect(() => {
+    return () => {
+      if (pollingInterval) {
+        clearInterval(pollingInterval);
+      }
+    };
+  }, [pollingInterval]);
 
   return (
     <div className="container">
       <Head>
         <title>YouTube Video Summarizer</title>
-        <meta name="description" content="Get summaries of YouTube videos" />
+        <meta name="description" content="Get AI-powered summaries of YouTube videos" />
         <link rel="icon" href="/favicon.ico" />
       </Head>
 
@@ -68,7 +136,7 @@ export default function Home() {
         </h1>
 
         <p className="description">
-          Enter a YouTube URL to get a transcript and AI-generated summary
+          Enter a YouTube URL to get an AI-generated summary
         </p>
 
         <form onSubmit={handleSubmit} className="form">
@@ -79,6 +147,7 @@ export default function Home() {
             placeholder="https://www.youtube.com/watch?v=..."
             className="input"
             required
+            disabled={isLoading}
           />
           <button type="submit" className="button" disabled={isLoading}>
             {isLoading ? 'Processing...' : 'Get Summary'}
@@ -101,9 +170,21 @@ export default function Home() {
           </div>
         </div>
 
+        {isLoading && (
+          <div className="progress">
+            <div className="spinner"></div>
+            <p>{progressStage || 'Processing video...'}</p>
+            <p className="hint">This may take up to a minute. Please wait...</p>
+          </div>
+        )}
+
         {error && (
           <div className="error">
             <p>{error}</p>
+            <p className="suggestion">
+              Try another video or check if this video has captions enabled.
+              You can enable automatic captions on YouTube by clicking the CC button.
+            </p>
           </div>
         )}
 
@@ -111,7 +192,7 @@ export default function Home() {
           <div className="result">
             <h2>{result.title}</h2>
             <div className="video-info">
-              <p><strong>Video ID:</strong> {result.video_id}</p>
+              <p><strong>Video ID:</strong> {result.videoId}</p>
               {result.language && <p><strong>Language:</strong> {result.language}</p>}
               {result.method && <p><strong>Method used:</strong> {result.method}</p>}
             </div>
@@ -119,7 +200,7 @@ export default function Home() {
               <iframe
                 width="100%"
                 height="215"
-                src={`https://www.youtube.com/embed/${result.video_id}`}
+                src={`https://www.youtube.com/embed/${result.videoId}`}
                 title={result.title}
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
@@ -127,55 +208,43 @@ export default function Home() {
               ></iframe>
             </div>
             
-            {result.success && (
-              <div className="content-tabs">
-                <div className="tabs">
-                  <button 
-                    className={`tab ${activeTab === 'summary' ? 'active' : ''}`}
-                    onClick={() => setActiveTab('summary')}
-                    disabled={!result.summary}
-                  >
-                    Summary
-                  </button>
-                  <button 
-                    className={`tab ${activeTab === 'transcript' ? 'active' : ''}`}
-                    onClick={() => setActiveTab('transcript')}
-                  >
-                    Transcript
-                  </button>
-                </div>
+            <div className="content-tabs">
+              <div className="tabs">
+                <button 
+                  className={`tab ${activeTab === 'summary' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('summary')}
+                  disabled={!result.summary}
+                >
+                  Summary
+                </button>
+                <button 
+                  className={`tab ${activeTab === 'transcript' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('transcript')}
+                >
+                  Transcript
+                </button>
+              </div>
+              
+              <div className="tab-content">
+                {activeTab === 'summary' && (
+                  <div className="summary-container">
+                    {result.summary ? (
+                      <div className="summary">{result.summary}</div>
+                    ) : (
+                      <div className="error-message">
+                        <p>{result.error || "Couldn't generate summary. Try viewing the transcript instead."}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
                 
-                <div className="tab-content">
-                  {activeTab === 'summary' && (
-                    <div className="summary-container">
-                      {result.summary ? (
-                        <div className="summary">{result.summary}</div>
-                      ) : (
-                        <div className="error-message">
-                          <p>{result.summary_error || "Couldn't generate summary. Try viewing the transcript instead."}</p>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  
-                  {activeTab === 'transcript' && (
-                    <div className="transcript-container">
-                      <pre className="transcript">{result.transcript}</pre>
-                    </div>
-                  )}
-                </div>
+                {activeTab === 'transcript' && (
+                  <div className="transcript-container">
+                    <pre className="transcript">{result.transcript}</pre>
+                  </div>
+                )}
               </div>
-            )}
-            
-            {!result.success && (
-              <div className="error-message">
-                <p>{result.error || "Failed to retrieve transcript"}</p>
-                <p className="suggestion">
-                  Try another video or check if this video has captions enabled.
-                  You can enable automatic captions on YouTube by clicking the CC button.
-                </p>
-              </div>
-            )}
+            </div>
           </div>
         )}
       </main>
@@ -254,11 +323,50 @@ export default function Home() {
           background-color: #ccc;
           cursor: not-allowed;
         }
+        
+        .progress {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          margin: 2rem 0;
+          padding: 1.5rem;
+          background-color: #e6f7ff;
+          border-radius: 8px;
+          width: 100%;
+          max-width: 600px;
+        }
+        
+        .progress p {
+          margin-top: 1rem;
+          color: #0070f3;
+          font-weight: 500;
+        }
+        
+        .hint {
+          font-size: 0.875rem;
+          color: #666 !important;
+          font-weight: normal !important;
+          margin-top: 0.5rem !important;
+        }
+        
+        .spinner {
+          border: 4px solid rgba(0, 0, 0, 0.1);
+          width: 36px;
+          height: 36px;
+          border-radius: 50%;
+          border-left-color: #0070f3;
+          animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
 
         .error {
           color: #d32f2f;
           background-color: #ffebee;
-          padding: 1rem;
+          padding: 1.5rem;
           border-radius: 5px;
           width: 100%;
           max-width: 600px;

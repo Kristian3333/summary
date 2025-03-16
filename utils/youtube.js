@@ -7,38 +7,67 @@ import axios from 'axios';
 export function extractVideoId(url) {
   if (!url) return null;
   
-  // Handle various YouTube URL formats
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^?&/#]+)/,
-    /youtube\.com\/watch.*?[?&]v=([^?&/#]+)/,
-    /youtube\.com\/shorts\/([^?&/#]+)/
-  ];
-  
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match && match[1]) {
-      return match[1];
+  try {
+    // Handle various YouTube URL formats
+    const patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^?&/#]+)/,
+      /youtube\.com\/watch.*?[?&]v=([^?&/#]+)/,
+      /youtube\.com\/shorts\/([^?&/#]+)/
+    ];
+    
+    for (const pattern of patterns) {
+      const match = url.match(pattern);
+      if (match && match[1]) {
+        return match[1];
+      }
     }
+    
+    // Try parsing URL object if it's a valid URL
+    try {
+      const urlObj = new URL(url);
+      if (urlObj.hostname.includes('youtube.com')) {
+        const videoId = urlObj.searchParams.get('v');
+        if (videoId) return videoId;
+      }
+    } catch (e) {
+      // Not a valid URL, continue with other approaches
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error extracting video ID:', error);
+    return null;
   }
-  
-  return null;
 }
 
 /**
  * Get video title from YouTube video ID
  */
-export async function getVideoTitle(url) {
+export async function getVideoTitle(videoId) {
   try {
-    const videoId = extractVideoId(url);
     if (!videoId) {
-      throw new Error('Invalid YouTube URL');
+      throw new Error('Invalid video ID');
     }
     
-    // Fetch the watch page to extract title
+    // Try using oEmbed API first (this is more reliable)
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+      const response = await axios.get(oembedUrl, { timeout: 5000 });
+      
+      if (response.data && response.data.title) {
+        return response.data.title;
+      }
+    } catch (e) {
+      console.log('oEmbed method failed, trying alternative');
+    }
+    
+    // Fallback: Fetch the watch page to extract title
     const response = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      timeout: 5000
     });
     
     // Extract title from HTML
@@ -47,6 +76,12 @@ export async function getVideoTitle(url) {
       // Clean up title (remove " - YouTube" suffix)
       let title = titleMatch[1].replace(/\s*-\s*YouTube$/, '');
       return decodeHtmlEntities(title);
+    }
+    
+    // Another approach: look for meta tags
+    const metaTitleMatch = response.data.match(/<meta\s+name="title"\s+content="([^"]+)"/);
+    if (metaTitleMatch && metaTitleMatch[1]) {
+      return decodeHtmlEntities(metaTitleMatch[1]);
     }
     
     return 'Unknown Title';
@@ -62,195 +97,446 @@ export async function getVideoTitle(url) {
 function decodeHtmlEntities(text) {
   if (!text) return '';
   
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec));
-}
-
-/**
- * Get transcript directly from our internal API
- */
-async function getTranscriptDirect(videoId) {
-  try {
-    console.log(`Getting transcript directly for video ID: ${videoId}`);
-    
-    // Call our internal API that wraps the YouTube transcript functionality
-    const response = await axios.get(`/api/youtube-transcript?videoId=${videoId}`);
-    
-    console.log('Direct transcript API response:', response.status, response.statusText);
-    
-    if (!response.data || !response.data.success) {
-      console.log('Direct transcript API failed with data:', response.data);
-      throw new Error(response.data?.error || 'Failed to get transcript');
-    }
-    
-    // Validate transcript content
-    if (!response.data.transcript || response.data.transcript.trim().length < 10) {
-      console.log('Direct API returned too short transcript:', response.data.transcript);
-      throw new Error('Transcript is too short or empty');
-    }
-    
-    console.log('Successfully retrieved transcript via direct API');
-    return {
-      transcript: response.data.transcript,
-      language: response.data.language,
-      success: true
-    };
-  } catch (error) {
-    console.error('Direct transcript method failed with error:', error.message);
-    throw error;
+  const entities = {
+    '&amp;': '&',
+    '&lt;': '<',
+    '&gt;': '>',
+    '&quot;': '"',
+    '&#39;': "'",
+    '&apos;': "'"
+  };
+  
+  let decoded = text;
+  
+  // Replace named entities
+  for (const [entity, char] of Object.entries(entities)) {
+    decoded = decoded.replace(new RegExp(entity, 'g'), char);
   }
+  
+  // Replace numeric entities
+  decoded = decoded.replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec));
+  
+  return decoded;
 }
 
 /**
- * Get transcript from captions API
+ * Method 1: Get transcript using YouTube's timedtext API
  */
-async function getTranscriptFromCaptionsAPI(videoId) {
+async function getTranscriptFromTimedTextAPI(videoId) {
   try {
-    console.log(`Getting transcript from captions API for video ID: ${videoId}`);
+    console.log(`Getting transcript from timedtext API for video ID: ${videoId}`);
     
-    // Try multiple language options in order of preference
-    const languageCodes = ['en', 'en-US', 'en-GB', null, 'es', 'fr', 'de', 'auto'];
+    // Language options to try
+    const languages = ['en', 'en-US', 'en-GB', null, 'auto', 'es', 'fr', 'de'];
     
-    for (const langCode of languageCodes) {
+    for (const lang of languages) {
       try {
-        const url = `/api/captions?videoId=${videoId}${langCode ? `&lang=${langCode}` : ''}`;
-        console.log(`Trying captions API with language: ${langCode || 'default'}, URL: ${url}`);
+        // First, try to get the list of available transcripts
+        const trackListUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`;
+        const trackListResponse = await axios.get(trackListUrl, { timeout: 5000 });
         
-        const response = await axios.get(url);
-        console.log(`Captions API response for ${langCode || 'default'}:`, response.status);
-        
-        if (response.data && response.data.success && response.data.transcript) {
-          if (response.data.transcript.trim().length < 10) {
-            console.log('Captions API returned too short transcript for language', langCode);
-            continue;
-          }
-          
-          console.log(`Successfully retrieved transcript via captions API with language: ${langCode || 'default'}`);
-          return {
-            transcript: response.data.transcript,
-            language: response.data.language || langCode || 'unknown',
-            success: true
-          };
-        } else {
-          console.log(`No valid transcript from captions API for language: ${langCode || 'default'}`);
+        // Check if the response contains any tracks
+        if (!trackListResponse.data.includes('<track')) {
+          console.log('No transcript tracks found');
+          continue;
         }
-      } catch (err) {
-        // Continue to the next language
-        console.log(`Caption API failed for language ${langCode || 'default'}:`, err.message);
+        
+        // Parse the tracks XML
+        const tracks = parseTracksXml(trackListResponse.data);
+        console.log(`Found ${tracks.length} transcript tracks`);
+        
+        if (tracks.length === 0) {
+          console.log('No valid tracks found after parsing');
+          continue;
+        }
+        
+        // Select the appropriate track based on language
+        let selectedTrack = null;
+        
+        if (lang) {
+          // Look for exact language match
+          selectedTrack = tracks.find(track => 
+            track.lang_code === lang || 
+            track.lang_code === lang.toLowerCase() ||
+            track.lang_code.startsWith(lang + '-')
+          );
+          
+          // For 'auto', look for auto-generated tracks
+          if (!selectedTrack && lang === 'auto') {
+            selectedTrack = tracks.find(track => 
+              track.name.includes('auto-generated') || 
+              track.name.includes('automatic')
+            );
+          }
+        }
+        
+        // If no matching track, use first available
+        if (!selectedTrack) {
+          // Prioritize English tracks
+          selectedTrack = tracks.find(track => 
+            track.lang_code === 'en' || 
+            track.lang_code === 'en-US' || 
+            track.lang_code === 'en-GB'
+          );
+          
+          // If still no match, use first track
+          if (!selectedTrack) {
+            selectedTrack = tracks[0];
+          }
+        }
+        
+        console.log(`Selected track: ${selectedTrack.lang_code}, ${selectedTrack.name}`);
+        
+        // Try to get transcript in JSON3 format first
+        try {
+          const json3Url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${selectedTrack.lang_code}&fmt=json3`;
+          const json3Response = await axios.get(json3Url, { timeout: 5000 });
+          
+          if (json3Response.data && json3Response.data.events) {
+            const transcript = json3Response.data.events
+              .filter(event => event.segs && event.segs.length > 0)
+              .map(event => 
+                event.segs
+                  .map(seg => seg.utf8 || '')
+                  .join(' ')
+              )
+              .join(' ');
+            
+            if (transcript.trim().length > 20) {
+              return {
+                success: true,
+                transcript,
+                language: selectedTrack.lang_code
+              };
+            }
+          }
+        } catch (error) {
+          console.log('JSON3 format failed, trying XML format');
+        }
+        
+        // Fallback to XML format
+        const captionsUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${selectedTrack.lang_code}`;
+        const xmlResponse = await axios.get(captionsUrl, { timeout: 5000 });
+        
+        if (xmlResponse.data) {
+          const transcript = parseTranscriptXml(xmlResponse.data);
+          
+          if (transcript.trim().length > 20) {
+            return {
+              success: true,
+              transcript,
+              language: selectedTrack.lang_code
+            };
+          }
+        }
+      } catch (error) {
+        console.log(`Failed with language ${lang || 'default'}:`, error.message);
+        // Continue to next language
       }
     }
     
-    throw new Error('No captions available from the captions API');
+    throw new Error('Could not retrieve transcript from timedtext API');
   } catch (error) {
-    console.error('Captions API method failed:', error);
+    console.error('Timedtext API method failed:', error);
     throw error;
   }
 }
 
 /**
- * Get transcript from embedded player page
+ * Method 2: Get transcript from YouTube's data in the watch page
  */
-async function getTranscriptFromEmbeddedPlayer(videoId) {
+async function getTranscriptFromWatchPage(videoId) {
   try {
-    console.log(`Getting transcript from embedded player for video ID: ${videoId}`);
+    console.log(`Getting transcript from watch page for video ID: ${videoId}`);
     
-    // First fetch the watch page instead of embed page (more reliable)
+    // Fetch the watch page
     const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    console.log(`Fetching watch page: ${watchUrl}`);
-    
     const response = await axios.get(watchUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      timeout: 8000
     });
     
     const html = response.data;
     
-    // Look for timedtext endpoint
-    const timedTextMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-    if (!timedTextMatch) {
+    // Try to find caption tracks in the initial data
+    const captionTracksRegex = /"captionTracks":\s*(\[.*?\])/;
+    const captionTracksMatch = html.match(captionTracksRegex);
+    
+    if (!captionTracksMatch) {
       console.log('No caption tracks found in watch page');
-      throw new Error('Could not find caption tracks');
+      throw new Error('No caption tracks found');
     }
     
     try {
-      // Parse the caption tracks data
-      let captionData = timedTextMatch[1].replace(/\\"/g, '"');
-      captionData = captionData.replace(/(\w+):/g, '"$1":');
-      const captionTracks = JSON.parse(captionData);
+      // Clean up the JSON string
+      let captionTracksJson = captionTracksMatch[1]
+        .replace(/\\"/g, '"')
+        .replace(/\\u003c/g, '<')
+        .replace(/\\u003e/g, '>')
+        .replace(/\\u0026/g, '&')
+        .replace(/\\r\\n|\\\n|\\\r/g, '')
+        .replace(/\\\//g, '/');
+      
+      // Convert to valid JSON by adding quotes to keys
+      captionTracksJson = captionTracksJson.replace(/([{,])\s*(\w+):/g, '$1"$2":');
+      
+      // Parse the JSON
+      const captionTracks = JSON.parse(captionTracksJson);
       
       if (!captionTracks || captionTracks.length === 0) {
-        console.log('No caption tracks in parsed data');
-        throw new Error('No caption tracks found');
+        throw new Error('No caption tracks found in parsed data');
       }
       
       console.log(`Found ${captionTracks.length} caption tracks`);
       
-      // Get the first available track (or English if available)
+      // Find English tracks or use the first one
       const englishTrack = captionTracks.find(track => 
-        track.languageCode === 'en' || track.languageCode === 'en-US' || track.languageCode === 'en-GB'
+        track.languageCode === 'en' || 
+        track.languageCode === 'en-US' || 
+        track.languageCode === 'en-GB'
       );
-      const track = englishTrack || captionTracks[0];
       
-      if (!track || !track.baseUrl) {
-        console.log('Selected track has no baseUrl:', track);
-        throw new Error('No baseUrl found for caption track');
+      const selectedTrack = englishTrack || captionTracks[0];
+      const trackUrl = selectedTrack.baseUrl;
+      
+      if (!trackUrl) {
+        throw new Error('No baseUrl found for selected track');
       }
       
-      console.log(`Using caption track: ${track.languageCode}, name: ${track.name || 'unnamed'}`);
+      // Fetch the transcript
+      const transcriptResponse = await axios.get(trackUrl, { timeout: 5000 });
       
-      // Fetch the actual captions data
-      const captionsResponse = await axios.get(track.baseUrl);
-      const xml = captionsResponse.data;
-      
-      // Parse the XML to get the transcript text
-      const textMatches = xml.match(/<text[^>]*>(.*?)<\/text>/g) || [];
-      if (textMatches.length === 0) {
-        console.log('No text elements found in caption data');
-        throw new Error('No text elements in captions');
+      if (!transcriptResponse.data) {
+        throw new Error('Empty transcript response');
       }
       
-      console.log(`Found ${textMatches.length} text elements in caption data`);
+      // Parse the XML transcript
+      const transcript = parseTranscriptXml(transcriptResponse.data);
       
-      const transcript = textMatches
-        .map(match => {
-          // Extract content between tags
-          let content = match.replace(/<text[^>]*>(.*?)<\/text>/, '$1');
-          // Decode HTML entities
-          content = decodeHtmlEntities(content);
-          return content;
-        })
-        .filter(text => text.trim().length > 0)
-        .join(' ');
-      
-      if (transcript.trim().length < 10) {
-        console.log('Embedded player method returned too short transcript:', transcript);
-        throw new Error('Transcript is too short or empty');
+      if (transcript.trim().length > 20) {
+        return {
+          success: true,
+          transcript,
+          language: selectedTrack.languageCode || 'unknown'
+        };
+      } else {
+        throw new Error('Transcript too short or empty');
       }
-      
-      console.log('Successfully retrieved transcript via embedded player');
-      return {
-        transcript,
-        language: track.languageCode || 'unknown',
-        success: true
-      };
-    } catch (e) {
-      console.error('Error parsing caption data:', e);
-      throw new Error('Failed to parse caption data: ' + e.message);
+    } catch (error) {
+      console.error('Error processing caption tracks:', error);
+      throw error;
     }
   } catch (error) {
-    console.error('Embedded player method failed:', error);
+    console.error('Watch page method failed:', error);
     throw error;
   }
 }
 
 /**
- * Main function to get video transcript
+ * Method 3: Use YouTube's experimental Innertube API (more recent version)
+ */
+async function getTranscriptFromInnertubeAPI(videoId) {
+  try {
+    console.log(`Getting transcript from Innertube API for video ID: ${videoId}`);
+    
+    // Get the watch page first
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const response = await axios.get(watchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      timeout: 8000
+    });
+    
+    // Extract API key and client version
+    const apiKeyMatch = response.data.match(/"INNERTUBE_API_KEY":\s*"([^"]+)"/);
+    const clientVersionMatch = response.data.match(/"INNERTUBE_CLIENT_VERSION":\s*"([^"]+)"/);
+    
+    if (!apiKeyMatch || !clientVersionMatch) {
+      throw new Error('Could not find API key or client version');
+    }
+    
+    const apiKey = apiKeyMatch[1];
+    const clientVersion = clientVersionMatch[1];
+    
+    // Get current timestamp
+    const timestamp = Math.floor(Date.now() / 1000);
+    
+    // Prepare request to get transcript
+    const url = `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`;
+    const data = {
+      context: {
+        client: {
+          clientName: "WEB",
+          clientVersion: clientVersion,
+          hl: "en",
+          gl: "US",
+          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          timeZone: "UTC",
+          utcOffsetMinutes: 0
+        },
+        request: {
+          useSsl: true,
+          internalExperimentFlags: [],
+          consistencyTokenJars: []
+        },
+        user: {},
+        clientScreenNonce: generateNonce(timestamp)
+      },
+      params: encodeCaptionParams(videoId)
+    };
+    
+    // Make request to get transcript data
+    const transcriptResponse = await axios.post(url, data, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      timeout: 8000
+    });
+    
+    // Parse the response
+    const transcriptData = transcriptResponse.data;
+    
+    if (!transcriptData || !transcriptData.actions) {
+      throw new Error('Invalid transcript response');
+    }
+    
+    // Extract transcript content
+    let transcript = '';
+    let language = 'unknown';
+    
+    try {
+      // Get the renderer containing the captions
+      const captionRenderer = transcriptData.actions[0].updateEngagementPanelAction?.content?.transcriptRenderer ||
+                             transcriptData.actions[0].appendContinuationItemsAction?.continuationItems[0]?.transcriptRenderer;
+      
+      if (!captionRenderer) {
+        throw new Error('Transcript renderer not found');
+      }
+      
+      // Get language info if available
+      const headerInfo = captionRenderer.header?.transcriptHeaderRenderer;
+      if (headerInfo && headerInfo.languageCode) {
+        language = headerInfo.languageCode;
+      }
+      
+      // Extract captions
+      const cueGroups = captionRenderer.body?.transcriptBodyRenderer?.cueGroups || [];
+      
+      transcript = cueGroups.map(group => {
+        const cues = group.transcriptCueGroupRenderer?.cues || [];
+        return cues.map(cue => {
+          return cue.transcriptCueRenderer?.cue?.simpleText || '';
+        }).join(' ');
+      }).join(' ');
+      
+      if (!transcript || transcript.trim().length < 20) {
+        throw new Error('Empty or too short transcript');
+      }
+      
+      return {
+        success: true,
+        transcript,
+        language
+      };
+    } catch (error) {
+      console.error('Error extracting transcript from Innertube response:', error);
+      throw error;
+    }
+  } catch (error) {
+    console.error('Innertube API method failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Helper function to generate client screen nonce
+ */
+function generateNonce(timestamp) {
+  return Buffer.from(`${timestamp}_${Math.random().toString(36).substr(2, 9)}`).toString('base64');
+}
+
+/**
+ * Helper function to encode caption params
+ */
+function encodeCaptionParams(videoId) {
+  const params = { videoId };
+  return Buffer.from(JSON.stringify(params)).toString('base64');
+}
+
+/**
+ * Parse the tracks XML to get available transcripts
+ */
+function parseTracksXml(xml) {
+  const tracks = [];
+  const trackRegex = /<track([^>]*)>/g;
+  let match;
+  
+  while ((match = trackRegex.exec(xml)) !== null) {
+    const attrs = match[1];
+    
+    const langCode = (attrs.match(/lang_code="([^"]*)"/) || [])[1];
+    const name = (attrs.match(/name="([^"]*)"/) || [])[1] || '';
+    const kind = (attrs.match(/kind="([^"]*)"/) || [])[1] || '';
+    
+    if (langCode) {
+      tracks.push({
+        lang_code: langCode,
+        name: name,
+        kind: kind
+      });
+    }
+  }
+  
+  // If no tracks found, try alternative format
+  if (tracks.length === 0) {
+    const altTrackRegex = /lang="([^"]*)"[^>]*name="([^"]*)"/g;
+    while ((match = altTrackRegex.exec(xml)) !== null) {
+      const langCode = match[1];
+      const name = match[2] || '';
+      
+      if (langCode) {
+        tracks.push({
+          lang_code: langCode,
+          name: name,
+          kind: ''
+        });
+      }
+    }
+  }
+  
+  return tracks;
+}
+
+/**
+ * Parse the transcript XML to get the text
+ */
+function parseTranscriptXml(xml) {
+  const textRegex = /<text[^>]*>(.*?)<\/text>/g;
+  let match;
+  const texts = [];
+  
+  while ((match = textRegex.exec(xml)) !== null) {
+    let text = match[1];
+    
+    // Decode HTML entities
+    text = decodeHtmlEntities(text);
+    
+    if (text.trim()) {
+      texts.push(text);
+    }
+  }
+  
+  return texts.join(' ');
+}
+
+/**
+ * Main function to get video transcript with multiple fallback methods
  */
 export async function getVideoTranscript(url) {
   try {
@@ -265,19 +551,14 @@ export async function getVideoTranscript(url) {
       };
     }
     
-    const title = await getVideoTitle(url);
-    console.log(`Got title: "${title}"`);
-    
-    let transcript = '';
-    let language = 'unknown';
-    let method = '';
-    let success = false;
+    const title = await getVideoTitle(videoId);
+    console.log(`Got title: "${title}" for video ID: ${videoId}`);
     
     // Try all methods in sequence
     const methods = [
-      { name: 'Direct API', fn: getTranscriptDirect },
-      { name: 'Captions API', fn: getTranscriptFromCaptionsAPI },
-      { name: 'Embedded player', fn: getTranscriptFromEmbeddedPlayer }
+      { name: 'TimedText API', fn: getTranscriptFromTimedTextAPI },
+      { name: 'Watch Page', fn: getTranscriptFromWatchPage },
+      { name: 'Innertube API', fn: getTranscriptFromInnertubeAPI }
     ];
     
     for (const methodObj of methods) {
@@ -285,45 +566,25 @@ export async function getVideoTranscript(url) {
         console.log(`Attempting method: ${methodObj.name}`);
         const result = await methodObj.fn(videoId);
         
-        if (result.success && result.transcript && result.transcript.trim().length >= 10) {
-          transcript = result.transcript;
-          language = result.language;
-          method = methodObj.name;
-          success = true;
+        if (result.success && result.transcript && result.transcript.trim().length >= 20) {
           console.log(`${methodObj.name} method succeeded`);
-          break;
+          
+          return {
+            video_id: videoId,
+            title: title,
+            transcript: result.transcript,
+            language: result.language,
+            url: url,
+            method: methodObj.name,
+            success: true
+          };
         } else {
           console.log(`${methodObj.name} method returned invalid result`);
         }
       } catch (error) {
-        console.log(`${methodObj.name} method failed:`, error.message);
+        console.log(`${methodObj.name} method failed: ${error.message}`);
         // Continue to next method
       }
-    }
-    
-    // Validate the transcript
-    if (success) {
-      // Check if transcript is empty or too short
-      if (!transcript || transcript.trim().length < 10) {
-        console.log('Retrieved transcript is empty or too short');
-        return {
-          video_id: videoId,
-          title: title,
-          url: url,
-          success: false,
-          error: 'Retrieved transcript is empty or too short'
-        };
-      }
-      
-      return {
-        video_id: videoId,
-        title: title,
-        transcript: transcript,
-        language: language,
-        url: url,
-        method: method,
-        success: true
-      };
     }
     
     // If all methods failed
