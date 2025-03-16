@@ -120,14 +120,18 @@ function decodeHtmlEntities(text) {
 }
 
 /**
- * Method 1: Get transcript using YouTube's timedtext API
+ * Method 1: Get transcript using YouTube's timedtext API with improved auto-caption support
  */
 async function getTranscriptFromTimedTextAPI(videoId) {
   try {
     console.log(`Getting transcript from timedtext API for video ID: ${videoId}`);
     
-    // Language options to try
-    const languages = ['en', 'en-US', 'en-GB', null, 'auto', 'es', 'fr', 'de'];
+    // Language options to try, including auto-caption formats
+    const languages = [
+      'en', 'en-US', 'en-GB',  // Standard English
+      'a.en',                  // Auto-generated English
+      null, 'auto'             // Any available language
+    ];
     
     for (const lang of languages) {
       try {
@@ -136,9 +140,9 @@ async function getTranscriptFromTimedTextAPI(videoId) {
         const trackListResponse = await axios.get(trackListUrl, { timeout: 5000 });
         
         // Check if the response contains any tracks
-        if (!trackListResponse.data.includes('<track')) {
-          console.log('No transcript tracks found');
-          continue;
+        if (!trackListResponse.data || !trackListResponse.data.includes('<track')) {
+          console.log('No transcript tracks found, trying auto-captions');
+          continue; // Try next language or auto-captions directly
         }
         
         // Parse the tracks XML
@@ -150,46 +154,43 @@ async function getTranscriptFromTimedTextAPI(videoId) {
           continue;
         }
         
-        // Select the appropriate track based on language
-        let selectedTrack = null;
+        // Select the appropriate track with improved auto-caption detection
+        let selectedTrack = selectBestTrack(tracks, lang);
         
-        if (lang) {
-          // Look for exact language match
-          selectedTrack = tracks.find(track => 
-            track.lang_code === lang || 
-            track.lang_code === lang.toLowerCase() ||
-            track.lang_code.startsWith(lang + '-')
-          );
-          
-          // For 'auto', look for auto-generated tracks
-          if (!selectedTrack && lang === 'auto') {
-            selectedTrack = tracks.find(track => 
-              track.name.includes('auto-generated') || 
-              track.name.includes('automatic')
-            );
-          }
-        }
-        
-        // If no matching track, use first available
         if (!selectedTrack) {
-          // Prioritize English tracks
-          selectedTrack = tracks.find(track => 
-            track.lang_code === 'en' || 
-            track.lang_code === 'en-US' || 
-            track.lang_code === 'en-GB'
-          );
-          
-          // If still no match, use first track
-          if (!selectedTrack) {
-            selectedTrack = tracks[0];
-          }
+          console.log(`No suitable track found for language: ${lang || 'default'}`);
+          continue;
         }
         
         console.log(`Selected track: ${selectedTrack.lang_code}, ${selectedTrack.name}`);
         
+        // Set up parameters for caption request
+        const params = {
+          v: videoId,
+          lang: selectedTrack.lang_code
+        };
+        
+        // Add kind parameter for auto-captions
+        const isAutoCaption = 
+          selectedTrack.name.includes('auto-generated') || 
+          selectedTrack.name.includes('automatic') ||
+          selectedTrack.kind === 'asr' ||
+          selectedTrack.lang_code.startsWith('a.');
+          
+        if (selectedTrack.kind) {
+          params.kind = selectedTrack.kind;
+        } else if (isAutoCaption) {
+          params.kind = 'asr';  // ASR = Automatic Speech Recognition
+        }
+        
         // Try to get transcript in JSON3 format first
         try {
-          const json3Url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${selectedTrack.lang_code}&fmt=json3`;
+          const json3Url = `https://www.youtube.com/api/timedtext?${new URLSearchParams({
+            ...params,
+            fmt: 'json3'
+          })}`;
+          
+          console.log(`Trying JSON3 format: ${json3Url}`);
           const json3Response = await axios.get(json3Url, { timeout: 5000 });
           
           if (json3Response.data && json3Response.data.events) {
@@ -203,29 +204,35 @@ async function getTranscriptFromTimedTextAPI(videoId) {
               .join(' ');
             
             if (transcript.trim().length > 20) {
+              console.log(`Successfully retrieved transcript via JSON3 format for ${selectedTrack.lang_code}`);
               return {
                 success: true,
                 transcript,
-                language: selectedTrack.lang_code
+                language: selectedTrack.lang_code,
+                isAuto: isAutoCaption
               };
             }
           }
         } catch (error) {
-          console.log('JSON3 format failed, trying XML format');
+          console.log(`JSON3 format failed for ${selectedTrack.lang_code}:`, error.message);
         }
         
         // Fallback to XML format
-        const captionsUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${selectedTrack.lang_code}`;
+        const captionsUrl = `https://www.youtube.com/api/timedtext?${new URLSearchParams(params)}`;
+        console.log(`Trying XML format: ${captionsUrl}`);
+        
         const xmlResponse = await axios.get(captionsUrl, { timeout: 5000 });
         
         if (xmlResponse.data) {
           const transcript = parseTranscriptXml(xmlResponse.data);
           
           if (transcript.trim().length > 20) {
+            console.log(`Successfully retrieved transcript via XML format for ${selectedTrack.lang_code}`);
             return {
               success: true,
               transcript,
-              language: selectedTrack.lang_code
+              language: selectedTrack.lang_code,
+              isAuto: isAutoCaption
             };
           }
         }
@@ -235,9 +242,99 @@ async function getTranscriptFromTimedTextAPI(videoId) {
       }
     }
     
-    throw new Error('Could not retrieve transcript from timedtext API');
+    // If all normal methods failed, try direct access to auto-captions
+    console.log('All normal transcript methods failed, trying direct auto-caption access');
+    return await getAutoGeneratedCaptions(videoId);
   } catch (error) {
     console.error('Timedtext API method failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Try to get auto-generated captions directly
+ */
+async function getAutoGeneratedCaptions(videoId) {
+  try {
+    console.log(`Trying to get auto-generated captions directly for video: ${videoId}`);
+    
+    // Languages to try for auto-captions
+    const languages = ['en', 'en-US', 'en-GB', null];
+    
+    for (const lang of languages) {
+      try {
+        // Build parameters for auto-captions request
+        const params = {
+          v: videoId,
+          kind: 'asr'  // ASR = Automatic Speech Recognition
+        };
+        
+        if (lang) {
+          params.lang = lang;
+        }
+        
+        // Try JSON3 format first
+        try {
+          const json3Url = `https://www.youtube.com/api/timedtext?${new URLSearchParams({
+            ...params,
+            fmt: 'json3'
+          })}`;
+          
+          console.log(`Trying auto-captions JSON3: ${json3Url}`);
+          const response = await axios.get(json3Url, { timeout: 5000 });
+          
+          if (response.data && response.data.events) {
+            const transcript = response.data.events
+              .filter(event => event.segs && event.segs.length > 0)
+              .map(event => 
+                event.segs
+                  .map(seg => seg.utf8 || '')
+                  .join(' ')
+              )
+              .join(' ');
+            
+            if (transcript.trim().length > 20) {
+              console.log(`Successfully retrieved auto-captions for language: ${lang || 'default'}`);
+              return {
+                success: true,
+                transcript,
+                language: lang || 'en',
+                isAuto: true
+              };
+            }
+          }
+        } catch (error) {
+          console.log(`Auto-captions JSON3 for ${lang || 'default'} failed:`, error.message);
+        }
+        
+        // Fallback to XML format for auto-captions
+        const xmlUrl = `https://www.youtube.com/api/timedtext?${new URLSearchParams(params)}`;
+        console.log(`Trying auto-captions XML: ${xmlUrl}`);
+        
+        const xmlResponse = await axios.get(xmlUrl, { timeout: 5000 });
+        
+        if (xmlResponse.data) {
+          const transcript = parseTranscriptXml(xmlResponse.data);
+          
+          if (transcript.trim().length > 20) {
+            console.log(`Successfully retrieved auto-captions XML for language: ${lang || 'default'}`);
+            return {
+              success: true,
+              transcript,
+              language: lang || 'en',
+              isAuto: true
+            };
+          }
+        }
+      } catch (error) {
+        console.log(`Failed to get auto-captions for ${lang || 'default'}:`, error.message);
+        // Continue to next language
+      }
+    }
+    
+    throw new Error('Could not retrieve auto-generated captions');
+  } catch (error) {
+    console.error('Auto-captions retrieval failed:', error);
     throw error;
   }
 }
@@ -292,15 +389,34 @@ async function getTranscriptFromWatchPage(videoId) {
       
       console.log(`Found ${captionTracks.length} caption tracks`);
       
-      // Find English tracks or use the first one
-      const englishTrack = captionTracks.find(track => 
-        track.languageCode === 'en' || 
-        track.languageCode === 'en-US' || 
-        track.languageCode === 'en-GB'
+      // First look for manual captions in English
+      let selectedTrack = captionTracks.find(track => 
+        (track.languageCode === 'en' || 
+         track.languageCode === 'en-US' || 
+         track.languageCode === 'en-GB') &&
+        !track.kind
       );
       
-      const selectedTrack = englishTrack || captionTracks[0];
+      // If no manual English captions, look for auto-captions
+      if (!selectedTrack) {
+        selectedTrack = captionTracks.find(track => 
+          (track.languageCode === 'en' || 
+           track.languageCode === 'en-US' || 
+           track.languageCode === 'en-GB' ||
+           track.languageCode === 'a.en') &&
+          (track.kind === 'asr' || track.isGenerated === true)
+        );
+      }
+      
+      // If still no match, use any available track
+      if (!selectedTrack) {
+        selectedTrack = captionTracks[0];
+      }
+      
       const trackUrl = selectedTrack.baseUrl;
+      const isAutoCaption = selectedTrack.kind === 'asr' || 
+                           selectedTrack.isGenerated === true ||
+                           selectedTrack.languageCode.startsWith('a.');
       
       if (!trackUrl) {
         throw new Error('No baseUrl found for selected track');
@@ -320,7 +436,8 @@ async function getTranscriptFromWatchPage(videoId) {
         return {
           success: true,
           transcript,
-          language: selectedTrack.languageCode || 'unknown'
+          language: selectedTrack.languageCode || 'unknown',
+          isAuto: isAutoCaption
         };
       } else {
         throw new Error('Transcript too short or empty');
@@ -409,6 +526,7 @@ async function getTranscriptFromInnertubeAPI(videoId) {
     // Extract transcript content
     let transcript = '';
     let language = 'unknown';
+    let isAuto = false;
     
     try {
       // Get the renderer containing the captions
@@ -421,8 +539,16 @@ async function getTranscriptFromInnertubeAPI(videoId) {
       
       // Get language info if available
       const headerInfo = captionRenderer.header?.transcriptHeaderRenderer;
-      if (headerInfo && headerInfo.languageCode) {
-        language = headerInfo.languageCode;
+      if (headerInfo) {
+        if (headerInfo.languageCode) {
+          language = headerInfo.languageCode;
+        }
+        
+        // Check if auto-generated
+        if (headerInfo.title) {
+          const titleStr = JSON.stringify(headerInfo.title);
+          isAuto = titleStr.includes('auto-generated') || titleStr.includes('automatic');
+        }
       }
       
       // Extract captions
@@ -442,7 +568,8 @@ async function getTranscriptFromInnertubeAPI(videoId) {
       return {
         success: true,
         transcript,
-        language
+        language,
+        isAuto
       };
     } catch (error) {
       console.error('Error extracting transcript from Innertube response:', error);
@@ -470,6 +597,78 @@ function encodeCaptionParams(videoId) {
 }
 
 /**
+ * Select the best caption track with improved auto-caption detection
+ */
+function selectBestTrack(tracks, preferredLang = 'en') {
+  if (!tracks || tracks.length === 0) return null;
+  
+  console.log('Selecting best track from available options');
+  
+  // First, try to find exact match for preferred language manual captions
+  let selectedTrack = tracks.find(track => 
+    track.lang_code === preferredLang && 
+    !track.name.includes('auto-generated') && 
+    !track.name.includes('automatic')
+  );
+  
+  if (selectedTrack) {
+    console.log(`Found manual ${preferredLang} captions`);
+    return selectedTrack;
+  }
+  
+  // Next, try to find English manual captions if preferred lang isn't English
+  if (preferredLang !== 'en') {
+    selectedTrack = tracks.find(track => 
+      (track.lang_code === 'en' || track.lang_code === 'en-US' || track.lang_code === 'en-GB') && 
+      !track.name.includes('auto-generated') && 
+      !track.name.includes('automatic')
+    );
+    
+    if (selectedTrack) {
+      console.log('Found English manual captions');
+      return selectedTrack;
+    }
+  }
+  
+  // Next, try to find auto-generated captions in preferred language
+  selectedTrack = tracks.find(track => 
+    (track.lang_code === preferredLang || 
+     track.lang_code.startsWith(preferredLang + '-') || 
+     track.lang_code === 'a.' + preferredLang) && 
+    (track.name.includes('auto-generated') || 
+     track.name.includes('automatic') ||
+     track.kind === 'asr')
+  );
+  
+  if (selectedTrack) {
+    console.log(`Found auto-generated ${preferredLang} captions`);
+    return selectedTrack;
+  }
+  
+  // Next, try to find English auto-generated captions if preferred lang isn't English
+  if (preferredLang !== 'en') {
+    selectedTrack = tracks.find(track => 
+      (track.lang_code === 'en' || 
+       track.lang_code === 'en-US' || 
+       track.lang_code === 'en-GB' || 
+       track.lang_code === 'a.en') && 
+      (track.name.includes('auto-generated') || 
+       track.name.includes('automatic') ||
+       track.kind === 'asr')
+    );
+    
+    if (selectedTrack) {
+      console.log('Found English auto-generated captions');
+      return selectedTrack;
+    }
+  }
+  
+  // Finally, just use the first available track
+  console.log('Using first available caption track');
+  return tracks[0];
+}
+
+/**
  * Parse the tracks XML to get available transcripts
  */
 function parseTracksXml(xml) {
@@ -488,7 +687,11 @@ function parseTracksXml(xml) {
       tracks.push({
         lang_code: langCode,
         name: name,
-        kind: kind
+        kind: kind,
+        is_auto: name.includes('auto-generated') || 
+                 name.includes('automatic') || 
+                 kind === 'asr' || 
+                 langCode.startsWith('a.')
       });
     }
   }
@@ -504,7 +707,10 @@ function parseTracksXml(xml) {
         tracks.push({
           lang_code: langCode,
           name: name,
-          kind: ''
+          kind: '',
+          is_auto: name.includes('auto-generated') || 
+                   name.includes('automatic') || 
+                   langCode.startsWith('a.')
         });
       }
     }
@@ -575,8 +781,9 @@ export async function getVideoTranscript(url) {
             transcript: result.transcript,
             language: result.language,
             url: url,
-            method: methodObj.name,
-            success: true
+            method: `${methodObj.name}${result.isAuto ? ' (Auto-Generated)' : ''}`,
+            success: true,
+            isAutoGenerated: result.isAuto
           };
         } else {
           console.log(`${methodObj.name} method returned invalid result`);
