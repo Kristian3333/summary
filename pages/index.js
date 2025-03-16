@@ -1,126 +1,119 @@
-// File: pages/index.js
+// pages/index.js with client-side orchestration
 import { useState, useEffect } from 'react';
 import Head from 'next/head';
 
 export default function Home() {
   const [url, setUrl] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [jobId, setJobId] = useState(null);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
-  const [pollingInterval, setPollingInterval] = useState(null);
-  const [progressStage, setProgressStage] = useState('');
+  const [videoInfo, setVideoInfo] = useState(null);
+  const [transcript, setTranscript] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [error, setError] = useState(null);
+  
+  // Track the processing stage
+  const [stage, setStage] = useState('idle'); // idle, video-info, transcript, summary, complete, error
+  
   const [examples, setExamples] = useState([
     'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     'https://www.youtube.com/watch?v=jNQXAC9IVRw',
     'https://youtu.be/xvFZjo5PgG0'
   ]);
 
-  // Handle form submission
   const handleSubmit = async (e) => {
     e.preventDefault();
     await processUrl(url);
   };
   
-  // Start processing a URL
   const processUrl = async (inputUrl) => {
-    setIsLoading(true);
-    setError(null);
-    setResult(null);
-    setJobId(null);
-    setProgressStage('');
+    // Reset state
     setUrl(inputUrl);
+    setError(null);
+    setVideoInfo(null);
+    setTranscript(null);
+    setSummary(null);
+    setStage('video-info');
     
-    // Clear any existing polling interval
-    if (pollingInterval) {
-      clearInterval(pollingInterval);
-      setPollingInterval(null);
-    }
-
     try {
-      // Step 1: Create a new job
-      const createResponse = await fetch('/api/create-job', {
+      // Step 1: Get video info (fast operation)
+      const infoResponse = await fetch('/api/video-info', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ url: inputUrl }),
       });
-
-      const createData = await createResponse.json();
       
-      if (!createResponse.ok || !createData.success) {
-        throw new Error(createData.error || 'Failed to create job');
+      const infoData = await infoResponse.json();
+      
+      if (!infoData.success) {
+        throw new Error(infoData.error || 'Failed to get video info');
       }
       
-      // Got job ID, start polling
-      setJobId(createData.jobId);
-      startPolling(createData.jobId);
+      setVideoInfo(infoData);
+      setStage('transcript');
+      
+      // Step 2: Get transcript in a separate request
+      const transcriptResponse = await fetch(`/api/transcript?videoId=${infoData.videoId}`);
+      const transcriptData = await transcriptResponse.json();
+      
+      if (!transcriptData.success) {
+        throw new Error(transcriptData.error || 'Failed to get transcript');
+      }
+      
+      setTranscript(transcriptData);
+      setStage('summary');
+      
+      // Step 3: Generate summary with the transcript
+      const summaryResponse = await fetch('/api/summarize', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transcript: transcriptData.transcript,
+          title: infoData.title,
+          videoId: infoData.videoId
+        }),
+      });
+      
+      const summaryData = await summaryResponse.json();
+      
+      if (!summaryData.success) {
+        // We have the transcript, so don't throw an error
+        // Just note that summary failed
+        console.error('Summary generation failed:', summaryData.error);
+        setStage('complete');
+        setActiveTab('transcript'); // Switch to transcript tab
+        return;
+      }
+      
+      setSummary(summaryData);
+      setStage('complete');
+      setActiveTab('summary'); // Default to summary tab when successful
+      
     } catch (err) {
+      console.error('Error processing URL:', err);
       setError(err.message);
-      setIsLoading(false);
+      setStage('error');
     }
   };
   
-  // Start polling for job status
-  const startPolling = (id) => {
-    // Start with 1-second intervals
-    const interval = setInterval(() => {
-      checkJobStatus(id);
-    }, 1000);
-    
-    setPollingInterval(interval);
-  };
-  
-  // Check job status
-  const checkJobStatus = async (id) => {
-    try {
-      const response = await fetch(`/api/job-status?jobId=${id}`);
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to get job status');
-      }
-      
-      // Update progress stage
-      if (data.status === 'processing' && data.progressStage) {
-        setProgressStage(data.progressStage);
-      }
-      
-      // If job is completed or failed, stop polling
-      if (data.status === 'completed' || data.status === 'failed') {
-        clearInterval(pollingInterval);
-        setPollingInterval(null);
-        setIsLoading(false);
-        
-        if (data.status === 'failed') {
-          setError(data.error || 'Processing failed');
-        } else {
-          setResult(data);
-          
-          // Default to summary tab if summary exists, otherwise show transcript
-          if (data.summary) {
-            setActiveTab('summary');
-          } else {
-            setActiveTab('transcript');
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Error checking job status:', err);
-      // Don't stop polling on temporary errors
+  // Get message based on current processing stage
+  const getStagingMessage = () => {
+    switch (stage) {
+      case 'video-info':
+        return 'Getting video information...';
+      case 'transcript':
+        return 'Retrieving video transcript...';
+      case 'summary':
+        return 'Generating AI summary...';
+      default:
+        return 'Processing...';
     }
   };
   
-  // Clean up interval on component unmount
-  useEffect(() => {
-    return () => {
-      if (pollingInterval) {
-        clearInterval(pollingInterval);
-      }
-    };
-  }, [pollingInterval]);
+  // Check if we're in a loading state
+  const isLoading = ['video-info', 'transcript', 'summary'].includes(stage);
 
   return (
     <div className="container">
@@ -173,7 +166,21 @@ export default function Home() {
         {isLoading && (
           <div className="progress">
             <div className="spinner"></div>
-            <p>{progressStage || 'Processing video...'}</p>
+            <p>{getStagingMessage()}</p>
+            {videoInfo && (
+              <div className="video-preview-small">
+                <h3>{videoInfo.title}</h3>
+                <iframe
+                  width="280"
+                  height="158"
+                  src={`https://www.youtube.com/embed/${videoInfo.videoId}`}
+                  title={videoInfo.title}
+                  frameBorder="0"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowFullScreen
+                ></iframe>
+              </div>
+            )}
             <p className="hint">This may take up to a minute. Please wait...</p>
           </div>
         )}
@@ -188,20 +195,20 @@ export default function Home() {
           </div>
         )}
 
-        {result && (
+        {stage === 'complete' && videoInfo && (
           <div className="result">
-            <h2>{result.title}</h2>
+            <h2>{videoInfo.title}</h2>
             <div className="video-info">
-              <p><strong>Video ID:</strong> {result.videoId}</p>
-              {result.language && <p><strong>Language:</strong> {result.language}</p>}
-              {result.method && <p><strong>Method used:</strong> {result.method}</p>}
+              <p><strong>Video ID:</strong> {videoInfo.videoId}</p>
+              {transcript && transcript.language && <p><strong>Language:</strong> {transcript.language}</p>}
+              {transcript && transcript.method && <p><strong>Method used:</strong> {transcript.method}</p>}
             </div>
             <div className="video-preview">
               <iframe
                 width="100%"
                 height="215"
-                src={`https://www.youtube.com/embed/${result.videoId}`}
-                title={result.title}
+                src={`https://www.youtube.com/embed/${videoInfo.videoId}`}
+                title={videoInfo.title}
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
@@ -213,7 +220,7 @@ export default function Home() {
                 <button 
                   className={`tab ${activeTab === 'summary' ? 'active' : ''}`}
                   onClick={() => setActiveTab('summary')}
-                  disabled={!result.summary}
+                  disabled={!summary}
                 >
                   Summary
                 </button>
@@ -228,11 +235,11 @@ export default function Home() {
               <div className="tab-content">
                 {activeTab === 'summary' && (
                   <div className="summary-container">
-                    {result.summary ? (
-                      <div className="summary">{result.summary}</div>
+                    {summary ? (
+                      <div className="summary">{summary.summary}</div>
                     ) : (
                       <div className="error-message">
-                        <p>{result.error || "Couldn't generate summary. Try viewing the transcript instead."}</p>
+                        <p>Sorry, we couldn't generate a summary. Try viewing the transcript instead.</p>
                       </div>
                     )}
                   </div>
@@ -240,7 +247,13 @@ export default function Home() {
                 
                 {activeTab === 'transcript' && (
                   <div className="transcript-container">
-                    <pre className="transcript">{result.transcript}</pre>
+                    {transcript ? (
+                      <pre className="transcript">{transcript.transcript}</pre>
+                    ) : (
+                      <div className="error-message">
+                        <p>Transcript not available.</p>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -340,6 +353,17 @@ export default function Home() {
           margin-top: 1rem;
           color: #0070f3;
           font-weight: 500;
+        }
+        
+        .video-preview-small {
+          margin: 1rem 0;
+          text-align: center;
+        }
+        
+        .video-preview-small h3 {
+          margin-bottom: 0.5rem;
+          font-size: 1rem;
+          color: #333;
         }
         
         .hint {
